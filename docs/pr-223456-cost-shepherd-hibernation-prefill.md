@@ -1,0 +1,22 @@
+# Introduce cost-shepherd: tenant hibernation windows, prefill safety-net, and quant-fallback profiles
+
+Motivation: Tenants with long low-traffic windows accrue unit-cost overhead (idle GPU memory, warmup token consumption) but suffer high tail latency if they go fully cold. This PR introduces a tenant-level automation agent (cost-shepherd) that coordinates three complementary levers: (1) hibernation windows to scale down capacity for inactive tenants, (2) a configurable prefill safety-net that preserves minimal KV cache/prefill state to bound cold-start latency, and (3) quant-fallback profiles that automatically choose higher-fidelity quantization when quality regressions exceed configured thresholds.
+
+What this PR adds: CLI: a new command-line tool (cmd/cost-shepherd) for previewing tenant hibernation plans, dry-run simulation, and exporting policy suggestions. Control-plane controller: pkg/controller/cost_shepherd.go implements tenant state transitions and policy evaluation based on usage signals (qps, avg tokens, warmup rate). Runtime agent: runtime/prefill/agent.go to orchestrate lightweight prefill caches and probe warm pools. Quantization selector: runtime/quant/profiles.go contains logic to map quality metrics to quant-fallback decisions and exposes an HTTP probe for the optimizer. Console/UI: console/ui/tenants/settings.tsx surfaces hibernation windows and safety-net toggles. Defaults & charts: configs/defaults/cost-shepherd.yaml and helm/templates/cost-shepherd.yaml. Tests: end-to-end integration tests in tests/integration/prefill_safety_test.go and perf lab harness changes under benchmark-lab/. Docs: docs/cli/cost-shepherd.md and docs/ops/hybrid-quant-fallback.md.
+
+Design notes and safety: Policies are tenant-scoped and opt-in by default. Hibernation is a graceful scale-to-zero of dedicated resources with a configurable low-watermark threshold; hibernation is prevented if a tenant has active SLA overrides. The prefill safety-net keeps a tiny approximate prefix/KV cache (configurable size) and a warm probe token so latency on first request is bounded. Quant-fallback profiles are applied conservatively: we monitor quality delta against golden prompts and only fallback for the matching model family and sequence-length buckets. All automated actions are logged and reversible.
+
+Rollout plan: Canary 5% of tenants in staging for 48 hours with traffic replay from perf-canary; 20% in production after 7 days if key metrics (p99 latency, quality delta, cost/unit) remain within thresholds. The CLI includes a dry-run mode used in the canary.
+
+Migration: Default policy is disabled; customers can opt in via Console or CLI. Helm chart adds a feature flag to enable cost-shepherd controller in Private deployments.
+
+Checklist: Add docs (done), add feature flags (done), telemetry keys (done), unit + e2e tests (done), canary rollout plan (documented).
+Diego Morales: Overall nice separation of concerns. A few asks: 1) add metric for 'hibernation_undesired_wakeups' and 2) protect tenant state transitions with optimistic locking to avoid races during bulk policy updates.
+Author (Aisha): Added hibernation_undesired_wakeups metric; switched to versioned tenant state with compare-and-swap and unit tests cover contention case.
+Lena Ho: Concerned about cost-shepherd keeping credentials for warm probes in private installations. Please ensure we use ephemeral tokens and document rotation.
+Author (Aisha): Implemented ephemeral probe tokens (15m TTL) and added operator notes to docs/ops/hybrid-quant-fallback.md. Marked for security review.
+Michael K. Park: Integration tests flaky earlier — saw a race between prefill eviction and worker shutdown. Please add an explicit drain path and re-run perf lab.
+Author (Aisha): Added drain hook in runtime/prefill/agent.go and re-ran perf lab; CI run green after fixes. Ready for approval.
+Diego Morales: Approving. Left a minor nit on log message wording.
+Introduce Cost Shepherd: tenant hibernation windows to reduce idle costs; prefill safety-net to bound cold-start latency; quant-fallback profiles to prevent quality regressions under aggressive quantization; new CLI for dry-run and policy export; feature is opt-in and behind feature flag; rollout via canary as documented.
+smoke: verified tenant opt-in flow via CLI and Console; simulated cold-starts with and without safety-net; observed p99 latency improvement on prefill-enabled tenants and cost reduction for hibernated tenants during windows.
