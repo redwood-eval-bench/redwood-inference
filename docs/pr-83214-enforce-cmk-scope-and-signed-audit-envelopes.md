@@ -1,0 +1,16 @@
+# enforce-cmk-scope-and-signed-audit-envelopes
+
+Motivation: Private installs must guarantee that customer-managed keys (CMKs) and audit logs cannot be accidentally routed to an out-of-scope region or tenant boundary. This PR introduces an installer-side enforcement layer that 1) binds CMK selection to explicit organizational scope labels (org_id and location_tag), 2) validates key origin at runtime during first-boot and upgrade flows, and 3) encapsulates audit events in signed envelopes before forwarding to remote collectors.
+Arjun Patel: Can we avoid an installer-wide secret for signing and instead wire to KMS-backed ephemeral keys? (commented on installer/audit/signing_util.go)
+Maya Torres: Answered: we generate a node-local ephemeral key on first boot and wrap it with the tenant CMK; the signing util persists only the wrapped blob. Added comments and tests to prove unwrap path.
+Leah Kim: Request change: add a toggle to disable envelope signing for air-gapped deploys and document the compliance implications.
+Maya Torres: Added 'auditEnvelope.enabled' switch in Helm values.yaml with clear warning in docs. Kept enforced validation of CMK origin even when signing is disabled.
+Daniel Ortiz: Noted potential race in bootstrap_flow when KMS endpoint is unreachable; suggested fallback backoff and clearer failure messages.
+Maya Torres: Implemented exponential backoff and a distinct installer exit code when CMK validation fails so ops can surface the exact cause in telemetry.
+Installer: enforce CMK selection by org scope and add signed audit envelopes for remote collectors. New Helm toggles: 'cmkScope.orgId', 'cmkScope.locationTag', 'auditEnvelope.enabled'. Migration: nodes will validate and rewrap keys on first boot; see docs/private-installer/cmk-and-audit.md for rollback and air-gap guidance.
+Operators upgrading to this release must: 1) ensure their tenant CMKs are available to installer nodes, 2) set cmkScope.orgId and cmkScope.locationTag in values.yaml, 3) if air-gapped, optionally set auditEnvelope.enabled=false and follow the documented audit collection strategy. See docs/private-installer/cmk-and-audit.md for detailed steps.
+Enhances server-side enforcement of key residency and audit authenticity. No changes to API surface but adds signer artifact handling during install; secrets are wrapped with tenant CMK.
+Added metrics: installer.cmk_validation.success, installer.cmk_validation.failure_reason, installer.audit_envelope.signed_count. Logs include 'cmk_validation_source' and 'envelope_sign_status' for troubleshooting.
+Added e2e test that simulates a mismatched CMK origin and verifies installer aborts with code 42. Added smoke test for envelope signing and unwrap path using KMS emulator. Tests are gated behind 'security' tag in CI.
+Low-medium: core installer behavior changes on boot path. Tested in staging with multi-tenant tag permutations. Added feature flags to disable signing for constrained environments.
+This change tightens compliance posture for Private deployments without changing hosted platform behavior. Ops teams should coordinate upgrades because nodes will attempt CMK validation during bootstrap; failure will prevent service start by design.
