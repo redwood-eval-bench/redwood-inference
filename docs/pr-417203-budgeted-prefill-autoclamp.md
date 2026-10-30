@@ -1,0 +1,10 @@
+# Budgeted prefill autoclamp: tenant-aware batch/clamp & quant scouting
+
+Context: customers with tight budgets were seeing unpredictable unit economics on cold starts and small bursty traffic. This PR introduces a budgeted-prefill autoclamp that dynamically limits prefill volume and batch shape for tenants based on a configurable monthly budget consumption profile and a short-term spend forecast. It also adds a non-invasive quantization scouting path that compares candidate int8/int4 profiles on a shadow traffic stream to inform safe fallbacks. Changes include a runtime policy controller, CLI dry-run mode, telemetry and alerting rules, and tests. Checklist: [x] design doc linked (Linear ENG-2419) [x] unit + integration tests [x] telemetry + dashboards [x] opt-in feature flag for rollout [x] CLI dry-run and exportable profile suggestion. Motivation: reduce tail spending during cold bursts while preserving P99 latency SLOs and avoid noisy rollouts of quant profiles. Backwards compatibility: default behavior unchanged unless tenant enables the budgeted-prefill policy. Rollout plan: start with internal tenants then staged rollout to small customers with observability gating.
+Adds tenant-budget-aware prefill clamping and a lightweight quantization scouting path. Backwards compatible; runtime switches default to off for existing tenants.
+Marcus Lee: Nice separation between controller and decision logic. Two asks: move budget formula into a testable package and add a synthetic workload test for microbursts.
+Priya Shah: Reply: moved budget math to pkg/prefill/budgetmath and added microburst scenario to integration tests (tests/integration/prefill_budget_sim_test.go).
+Evelyn Carter: Please ensure scout runner doesn't add tail latency to live paths; prefer shadow-only Goroutines and bounded concurrency.
+Priya Shah: Reply: quant scout is implemented in a shadow path with bounded worker pool and backpressure; added concurrency config and soft CPU budget enforcement.
+Diego Alvarez: CI flake on linux-integ, looks like test depends on /tmp cleanup ordering.
+Priya Shah: Reply: fixed cleanup ordering and re-ran CI.
