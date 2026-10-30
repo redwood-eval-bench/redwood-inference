@@ -1,0 +1,27 @@
+# fused kernel tiling + prefetch for INT8/FP8 quant paths to reduce p95 latency
+
+Motivation: our current INT8/FP8 inference paths show good throughput on long sequences but suffer p95 latency regressions under mixed request sizes due to suboptimal kernel layouts and missing prefetch across fused dequant->matmul->requant sequences. This PR implements a fused kernel tiling and software prefetch strategy across quantized paths to reduce memory stalls, aligns KV-cache allocations to tile boundaries, and adds a small micro-batching optimization for continuous-batching workloads.
+
+What this change does (high level): 1) Introduces a tiled fused kernel that performs dequant->matmul->requant in a single pass for INT8 and FP8 variants when the model layout matches (GEMM-friendly dims). 2) Adds a lightweight software prefetch schedule that issues prefetches for next tiles and KV cache slices to hide DRAM latency. 3) Aligns KV cache page allocations to tile boundaries and exposes a runtime hint in the scheduler to prefer tile-aligned KV slices for continuous batching. 4) Adds a small micro-batching path (batch sub-slices of size 2..8) for low-latency steady-state streaming that keeps latency SLOs while enabling efficient vectorized kernels. 5) Adds compatibility shims so fallback (dequant-fusion disabled) still uses the existing kernels.
+
+Implementation notes: - New files: serve/runtime/kernels/quant_tiled_fused.cc/.h implement fused kernels with explicit tiling and pointer-aliasing checks. - CPU and GPU prefetch helpers implemented behind runtime toggles: serve/runtime/kernels/prefetch.h (CPU), cuda/quant_prefetch.cu (GPU). - KV cache allocator now exposes allocate_aligned(size_t bytes, size_t tile_bytes) and is used by the scheduler when tile hints present. - Scheduler: serve/scheduler/tiling_scheduler.cpp adds a heuristic to pick tile-aligned backends and to split continuous-batching windows into micro-slices. - New perf harness bench/bench_quant_tiling.py (microbench) and tests/perf/test_quant_paths.py.
+
+Backward compatibility: the runtime uses a conservative autotune: fused-tiling enabled only when model metadata indicates contiguous attention heads and when quant config is compatible. Runtime flag: REDWOOD_QUANT_TILE_AUTO=true (default). If the fused path fails runtime checks it falls back gracefully to the existing dequant->matmul path. No API changes.
+
+Testing & validation: - Unit tests: kernels correctness validated against dequant->matmul reference on a matrix of sizes covering 8..4096 and different head counts. - Integration tests: end-to-end inference with streaming enabled, verifying outputs within tolerance (L2 < 1e-3 for FP8, < 1e-2 for INT8 where applicable). - Smoke tests on Dedicated with mixed traffic replay (see ci logs). - Benchmarks: see performance_summary field.
+
+Rollout: rolled out behind a feature flag and staged by model: default off for non-curated models; enabled for selected internal verified models. Observability hooks added to Console to show whether tiled fused kernels are in use per-request.
+
+Caveats & known issues: - On very short sequences (<32) the micro-batching overhead can increase CPU time; scheduler disables micro-slices for seq_len<32 by default. - Some older GPU drivers showed prefetch instruction stalls on very large tile sizes; conservative tile defaults chosen and an env var REDWOOD_QUANT_TILE_MAX_BYTES to override for experimentation.
+
+Checklist: - [x] Design review (ENG-5423) - [x] Benchmarks added - [x] Unit and integration tests - [x] Docs (release notes) - [x] Feature flag protected
+
+Microbench (Xeon + A100 baseline=existing dequant->matmul path): INT8 fused tiled kernel shows 1.85x median throughput improvement and 22% p95 latency reduction for seq_len=512..2048 on encoder-only layers. FP8 fused path shows 1.4x throughput and 18% p95 p95 reduction. Continuous-batching with micro-slices reduces p95 by additional 8-12% in streaming workloads while increasing steady-state CPU by ~6%. End-to-end customer traces with tiled kernels reduced tail latency spikes related to KV fetch by ~35%. Memory working set reduced by ~10% due to in-place fusion and reduced temporary buffers.
+Jared Huang: Can you add a microbenchmark comparing fused vs fallback on the 8-head 2048 length case? Also verify memory correctness with misaligned KV slices.
+Aisha Patel: Added bench_quant_tiling.py and included the 8-head 2048 case; KV allocator now clamps and reports misalignment to logs (see last commit).
+Lena Moretti: Please ensure autotune won't flip on for unknown models; suggested default off and opt-in via metadata.
+Aisha Patel: Autotune default is conservative; only curated models enabled by metadata + flag. Added explicit unit test for metadata gating.
+Calvin Brooks: CI flaky on CUDA prefetch kernel (timeout). Re-run required.
+Aisha Patel: Fixed a race in the CUDA prefetch stream and split the test to avoid long single-run time. Re-ran CI and green.
+Introduce fused tiled quantized kernels (INT8/FP8) with software prefetch and KV-cache tile alignment. Improves p95 latency and throughput for compatible models; enabled behind feature flag and model metadata. See docs/release/notes-quant-tiling.md for details and tunables.
+Ops: feature flag REDWOOD_QUANT_TILE_AUTO controls autotune; REDWOOD_QUANT_TILE_MAX_BYTES overrides max tile size. Added Console metric tiled_kernel_in_use (bool) and tiled_kernel_latency_breakdown. Watch for increased CPU on micro-batching; default heuristics disable micro-slicing for seq_len<32.
