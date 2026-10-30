@@ -1,0 +1,20 @@
+# tiered-slo-pause-with-hedge-reconnect-and-cb-soft-unlock
+
+Motivation: after an incident impact window on 2026-02-10 we observed tenants briefly flapping between global slowpath and local circuit states during transient regional congestion which caused duplicate retries and a spike in tail latency. This PR introduces a short, tiered SLO pause mechanism (per-tenant soft pause) that temporarily relaxes tight SLO enforcement for affected slots, combines it with a lightweight regional hedge-reconnect path that attempts a best-effort fallback to healthy nodes, and soft-unlocks circuit breakers to avoid long stalls. Design summary: 1) tiered_slo_pause: configurable pause windows by tenant priority (0/1/2) with exponential decay; 2) hedge_reconnect: non-blocking probe + fast switch to an alternate regional route with in-flight token tagging for tracing; 3) cb_soft_unlock: circuit breakers move to a 'soft-open' state after a short cooloff allowing a single hedged request before full reset. Rollback plan: feature flag off will revert behavior immediately; hotfix rollback documented in SUP-8842. Testing: unit tests for decay math and probe logic, integration test simulating regional congestion with synthetic load, manual canary in staging for 12h. Checklist: [x] design doc linked to ENG-9621; [x] unit tests; [x] integration test harness update; [x] staged canary; [x] production monitoring dashboard added. Notes: this is targeted as a minimal-risk hotfix to reduce tail bursts while preserve correctness of SLO accounting.
+Liam O'Connor (reviewer): Left a comment asking for clarity on tenant priority defaults and whether low-priority tenants can be evicted during the pause window. Requested adding unit tests for decay edge-cases.
+Maya Patel (author): Responded that priority defaults are documented in configs/README and updated tests to include decay edge cases. Explained eviction remains controlled by existing eviction pipeline; pause only affects SLO enforcement not eviction decisions.
+Zoe Chen (reviewer): Noted potential metric cardinality increase from per-tenant pause events; requested aggregation bucketting. Also requested that hedge probes be rate-limited per region.
+Maya Patel (author): Implemented aggregation by priority bucket and added probe rate limiter with token bucket per-region; pushed follow-up commit c3d9a11. Asked for a final pass on observability.
+Diego Martinez (approver): Approved after verifying integration test logs and canary telemetry; called out additional follow-up ticket ENG-9632 for trimming retaining metrics after 7d.
+a1f4c3c: add tiered_slo_pause implementation with config knobs and smoke tests
+b7d2e9f: implement hedge_reconnect probe + in-flight tagging and tracing headers
+c3d9a11: cb_soft_unlock state machine and metrics; add feature flag; update canary script
+services/slo-enforcer/slo_pause.go - added tiered pause logic and decay scheduler
+services/routing/hedge_connector.go - probe flow, non-blocking reconnect path, small helper comments
+services/circuitbreaker/state_machine.go - new soft-unlock transition and metrics emission
+configs/feature_flags.yaml - feature flag: slo_pause_hedge_reconnect: true by default in hotfix-canary
+infra/monitoring/dashboards/slo_pause_overview.json - dashboard panels for pause windows and restore rates
+tests/integration/region_congestion_sim_test.go - synthetic load scenario to assert behavior
+docs/operations/hotfixes.md - add playbook steps for toggling the feature flag and rollback
+Reduce tail latency during regional congestion by introducing a tiered SLO pause and hedged reconnect fallback; opt-in via feature flag; no breaking API changes; follow-up cleanup ticket ENG-9632 for metric retention trimming
+Hotfix canary deployed to us-east-1 and eu-west-1 for 12h then rolled to prod. If rollback required: flip feature flag slo_pause_hedge_reconnect to false and restart slo-enforcer pods; monitor slo_pause_overview dashboard and request success rate metrics. See SUP-8842 for incident trace.
