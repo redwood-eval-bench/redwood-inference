@@ -1,0 +1,39 @@
+# Probationary promote orchestrator with observation-conditioned staging and rollback scheduling
+
+Motivation: Progressive promotes (canary -> gradual promote -> full) need a middle 'probationary' phase where traffic is steered to the candidate but held to cohorts and observed under stricter telemetry gates. Existing staged-promote controllers either move too fast or rely on static windows; customers request an observation-conditioned probation with a scheduled rollback planner (ENG-3456).
+
+This PR implements a Probationary Promote Orchestrator that: (1) creates a transient probation lane after initial canary where cohorts are admitted incrementally, (2) attaches fine-grained observation gates (latency, error-rate, semantic-regression signal) with configurable thresholds and sample budgets, (3) supports per-cohort probation timeouts and grace tokens, (4) computes a rollback schedule dynamically based on historical noise and SLO budget, and (5) integrates with the Console rollout UI and existing rollout policies.
+
+Checklist:
+- [x] Design + spec linked (Linear ENG-3456)
+- [x] Runtime admission controller + probation state machine implemented
+- [x] Telemetry gating hooks + metric aggregators added
+- [x] Rollback scheduler and playbook generator implemented
+- [x] Unit + integration tests covering edge cases and failover
+- [x] Documentation snippets for Console and CLI
+
+Technical notes: The orchestrator introduces a small state-machine (Pending -> Probation -> Observed -> Promote/Abort) and a probation allocator that uses cohort opacity (fraction of users for sampling) and grace tokens to tolerate transient blips. Observation gates evaluate a prioritized rule-set: latency p99 delta, request error rate, model-quality regression score (from the eval pipeline). Each gate is evaluated over rolling windows; thresholds are configurable per-policy. The rollback scheduler uses a probabilistic backoff if telemetry is noisy: a candidate rollback time is proposed, then refined as more observations arrive; operators can opt into an automated rollback or prefer an alert-only mode.
+
+Compatibility: The change is opt-in via rollout policy YAML (probation: enabled: true). Existing promotes without probation continue to function unchanged. No API contract changes for inference clients.
+
+Commits summary: squash of feature branch into main. Key commits: probationary state machine, telemetry gate adapters, rollback scheduler, Console wiring, test harness updates.
+
+Files changed (high-level):
+- controller/probation_orchestrator.go: core state machine and admission logic
+- controller/rollback_scheduler.go: policy-driven scheduler and playbook generator
+- telemetry/gates/adapter.go: adapters for latency/error/model-quality signals
+- console/src/rollouts/probation-ux.tsx: small Console UI to toggle probation and show cohort status
+- e2e/tests/probation_flow.test.ts: end-to-end smoke tests
+- docs/rollouts/probation.md: user-facing docs and config examples
+
+Testing: CI runs the unit suite and e2e smoke with a mocked telemetry stream. Stress tests simulate noisy telemetry and confirm rollback schedule stability. On initial run the lint/build/test pipeline passed; a flakiness fix was added to the e2e harness (replayed events window increased).
+
+Related: ENG-8890 tracks further work to add causality checks from the evaluation harness. This PR focuses on operational safety and the scheduling model.
+
+Introduces a probationary promote orchestrator that enables observation-conditioned staging windows, per-cohort probation periods, and a configurable rollback scheduler. Backwards-compatible with existing rollout contracts; opt-in via policy config.
+Diego Ramos: Nice design. Two comments: (1) can we make the default probation window small so self-serve users don't get slowed, and (2) please add observability tags to identify probation cohort traces.
+Asha Menon: Thanks Diego — default probation window set to 5m for self-serve tier; added "probation.cohort" tag to tracing (see telemetry/gates/adapter.go).
+Evan Chen: I worried about false positives from p99 spikes. Recommend adding a noise-aware comparator (rolling median + MAD). Can we gate that behind policy?
+Asha Menon: Added noise-aware comparator and toggle in policy schema; default off. See commit 3c4d5e6. Also added unit tests for comparator edge cases.
+Priya Kapoor: Approving pending minor nit on docs wording (clarify rollback vs abort semantics).
+Asha Menon: Docs updated per Priya's suggestion; re-requested a docs review and then merged after CI green.
