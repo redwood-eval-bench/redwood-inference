@@ -1,0 +1,23 @@
+# gateway: introduce streaming throttles and compat fallbacks to stabilize function/tool calls
+
+Motivation: We observed intermittent truncated output and stalled streams for OpenAI-compat function/tool calling routes when the gateway routed to slow backends or hit memory pressure. Root causes: (1) small streaming proxy chunk sizes + aggressive flush timers produced many tiny frames that overwhelmed downstream sockets; (2) lack of per-route soft payload and in-flight token throttles allowed large tool invocations to saturate proxy buffers; (3) compatibility-layer routing always preferred streaming paths, which made fallback to non-streaming endpoints difficult when KV-cache/backpressure occurred.
+
+This PR introduces three coordinated changes to the gateway and compatibility layer: 1) adjustable streaming coalescing and buffer targets (gateway/proxy): coalesce small writes into configurable buffer_target_bytes and delay flush by stream_chunk_coalesce_ms to reduce syscall and socket pressure; 2) per-route soft payload limits and in-flight token throttles: new route config fields route.payload_soft_limit_bytes and route.max_inflight_tokens that allow controllers to apply backpressure before hitting hard quotas; 3) compatibility-layer fallback policy: openai_compat.fallback_to_non_streaming (boolean) plus a short-circuit that switches a request to a non-streaming variant when proxy buffer latency or backend tail latency crosses thresholds. The compatibility fallback preserves the OpenAI-style HTTP surface (content-type + response shape) but uses chunked non-streaming transfer to avoid timeouts and partial payload corruption.
+
+Implementation summary: commits add a new StreamCoalescer class in gateway/proxy that sits between the request router and socket writer; introduce RouteConfig fields and validation in api/router; extend openai compat layer to annotate requests with compat_mode and fallback hints; add adaptive counters and metrics (gw.stream.coalesce.ms, gw.buffer.target_bytes, gw.route.inflight_tokens) for observability; wire a graceful downgrade path that retries the same request with streaming=false when a transient proxy-buildup condition is detected.
+
+Files touched (high-level): gateway/proxy/stream_coalescer.go; api/router/route_config.go; api/router/middleware_throttle.go; compat/openai/handler.go; compat/openai/integration_test.go; observability/metrics_definitions.yaml; docs/gateway/streaming_fallbacks.md; e2e/test-scenarios/tool-calls-large-payload.yml and wrapper scripts for local reproductions.
+
+Testing and rollout: added unit tests for coalescer logic and per-route throttles, integration test that simulates a slow backend to validate fallback preserves payload integrity, and an e2e run with the canary harness in perf-canary. CI initially failed due to a race in coalescer shutdown; fixed by adding a drain-with-timeout behavior. This was validated in CI (two green runs) and in a staged canary (10% of traffic) for 48h with no regressions in latency SLOs.
+
+Operational notes: default behavior is opt-in per-route to avoid changing existing tenants. New route schema has sensible defaults matching previous behavior (coalesce disabled, fallback disabled). Recommended rollout: enable route.payload_soft_limit_bytes for the highest-throughput OpenAI-compat routes (chat and function-calls) and set openai_compat.fallback_to_non_streaming=true for tenants with strict availability requirements. Monitor gw.stream.dropped_frames and gw.route.fallback.count.
+
+Related work: complements ENG-2990 (proxy headroom refactor) and ENG-3140 (route payload quota tuning). Linear: ENG-3092 tracks the rollout and docs updates. SUP ticket SUP-1276 contains customer repro logs that motivated this change.
+
+Release notes: Stabilizes OpenAI-compat streaming for large tool/function calls by adding configurable stream coalescing, per-route soft limits, and a compatibility fallback to non-streaming transfers when proxy/backpressure conditions occur.
+Marta Gómez: Can you add a comment on why the defaults are opt-in? -> Author: Defaults are opt-in to avoid touching tenants; added explanation in docs/gateway/streaming_fallbacks.md.
+Liam Park: nit: prefer 128KB default buffer_target_bytes for heavy chat traffic; Author: lowered default to 128k and added explanation in route_config.go comments.
+Ethan Chen: observed a possible edge where non-streaming fallback could double-send webhooks; Author: added idempotency token and test to prevent double-send.
+Marta Gómez: approved after integration tests and canary results look good.
+Liam Park: approving — please ensure runbook entry before full rollout.
+Release manager (audio): merged via squash after approvals.
