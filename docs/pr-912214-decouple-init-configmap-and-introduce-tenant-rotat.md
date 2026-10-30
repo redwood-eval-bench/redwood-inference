@@ -1,0 +1,12 @@
+# decouple-init-configmap-and-introduce-tenant-rotation-operator-helpers
+
+Motivation: In private installs we need a small, immutable init ConfigMap consumed by several init jobs and a lightweight tenant-rotation helper that can be turned on/off independently. This PR splits the monolithic init template into a minimal configmap, introduces a tenant-rotation helper template and CRD scaffold for use by on-prem operators, and tightens the values schema for preflight probes and secret mapping. Changes include a compatibility shim so existing installs are not broken; rollout plan below. Checklist: - split chart/templates/init.yaml into configmap + init-job templates; - add charts/_helpers.tpl functions for secretName and rotationLabel; - add values.schema.json entries for preflight.probes and rotation.enabled; - add templates/tenant-rotation-crd.yaml (scaffold) and templates/tenant-rotation-job.yaml (opt-in); - update NOTES.txt and README with operator opt-in steps; - CI: extend helm lint and kubeconform checks; Related: linear ENG-1882 tracks followups for tenancy metrics and a subsequent operator binary. This description is intentionally single-line to fit PR page export conventions.
+split init template into configmap + job templates
+(helm): move static scripts to configmap
+add tenant-rotation helper templates and CRD scaffold
+values.schema: tighten preflight/probe typing and add rotation.enabled boolean; update chart readme and notes
+Aisha Patel: Good separation of concerns. Two requests: 1) ensure the configmap checksum annotation is preserved on the init job so rollouts pick up changes, 2) add a feature gate to values.schema for rotation.enabled defaulting to false.
+Mateo Alvarez: Addressed both items; added checksum annotation using tpl and included rotation.enabled in values.schema with default false. Also added e2e helm smoke test to CI to cover the opt-in path.
+Marco Chen: Left a nit on helper naming (secretName vs mapSecretName) to avoid collision with other charts. Suggest prepend 'rpw' to helper names. Not blocking.
+Mateo Alvarez: Renamed helpers to rpw.secretName and rpw.rotationLabel; updated references across templates and README.
+Split init scripts into a minimal immutable ConfigMap and add an opt-in tenant rotation helper CRD/job; values.schema tightened for preflight probes and rotation.enabled default is false; no breaking changes for existing installs.
