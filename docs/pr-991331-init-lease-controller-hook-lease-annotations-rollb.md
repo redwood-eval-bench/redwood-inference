@@ -1,0 +1,25 @@
+# Introduce init-lease-controller, hook-lease annotations, and per-tenant rollback-timer values
+
+Motivation: Private installs with high tenant concurrency occasionally caused conflicting init hooks to collide (multiple tenants trying to perform the same one-off migration at once) and rapid automatic rollback races during partial failure windows. This PR introduces a lightweight init-lease-controller and a set of helm values/annotations that let the installer coordinate init work across tenants and apply a controlled rollback timer per-tenant to give long-running init jobs time to complete before triggering global rollback.
+
+What this changes (summary): - Adds a CRD-like manifest and a minimal init-lease-controller helm template (runs as Job when enabled) that grants short-lived leases scoped to a tenant namespace for init hooks. - Adds 'hook.redwood.ai/lease-key' and 'hook.redwood.ai/lease-duration' annotations to templates so init hooks can opt-in to the lease protocol. - Introduces values.private.initLease.enabled and values.private.rollbackTimer.perTenantMillis (with safe defaults) to the values.schema.json to make this opt-in and configurable for upgrades. - Adds templating helpers _helpers.tpl for lease annotations and a migrationJob to populate a default lease-holder config on older installs.
+
+Checklist: [x] Add values.schema.json entries and defaults [x] Add init-lease-controller job template and helper functions [x] Add annotated examples and README updates [x] Add migration job and helm post-upgrade note [x] Add unit tests for templating logic [x] Run upgrade tests in perf-canary
+
+Backward compatibility and migration: This is opt-in by default (initLease.enabled = false). For clusters that want the behavior we recommend enabling initLease during a maintenance window. A migration job (templates/migrate-default-lease.yaml) is included to seed a tenant default lease-duration value; it is guarded by a values flag to avoid accidental writes during dry runs. Existing hooks that do not include the lease annotations are unaffected.
+
+Usage notes: - To enable: set private.initLease.enabled=true in your values and optionally tune private.rollbackTimer.perTenantMillis. - To opt a hook in: add annotations: hook.redwood.ai/lease-key: "init-db" and hook.redwood.ai/lease-duration: "30s" to the hook template metadata. The hook init wrapper will attempt to acquire the lease before running expensive work and defer or exit cleanly if lease cannot be obtained. - The rollback-timer prevents the chart from marking an upgrade as failed for tenants whose init hooks are still finishing; it is per-tenant so other tenants can still proceed.
+
+Testing and validation: - Unit tests for helper templating and values schema (charts unit). - Integration validation in perf-canary that simulates 200 concurrent tenant installs with staggered init durations. - CI: lint/unit/integration passed; one flaky integration test was retried and resolved. See CI summary below.
+
+Notes for operators: The init-lease-controller is intentionally minimal — it's a Job (not a long-running controller) created during upgrades when enabled. It acquires leases via ConfigMap-based compare-and-swap in the tenant namespace to avoid requiring additional cluster-level permissions. For air-gapped/on-prem clusters this keeps the attack surface small. If you need cross-namespace coordination in a multi-tenant cluster, contact SRE for recommended RBAC changes.
+Add init-lease-controller and hook-lease annotations to coordinate tenant-scoped init jobs; introduce rollback-timer per-tenant value to reduce noisy rollbacks during rolling upgrades. Backwards compatible; includes migration helper to set a default lease for existing installs.
+Asha Patel: Can we avoid cluster-scoped RBAC for the lease controller? Please scope to tenant namespaces where possible.
+Liam Chen: Done — switched controller to a Job that operates in each tenant namespace and uses ConfigMap CAS. Updated templates and added notes to README.
+Miguel Rivera: Tests look good, but add a flag to skip migration job during dry-run installs; we don't want accidental writes.
+Liam Chen: Added conditional guard 'private.migration.seedDefaultLease' and documented the behavior. PTAL.
+Asha Patel: Approving after verifying migration guard and RBAC scope.
+Miguel Rivera: Approving. CI green.
+Squash merged into main after approvals. Migration guard defaulted to false to avoid unintended changes; feature remains opt-in.
+If you enable private.initLease on an existing cluster, run helm upgrade with --set private.migration.seedDefaultLease=true during a maintenance window to seed defaults. Alternatively run the migration job manually with kubectl apply -f charts/private/templates/migrate-default-lease.yaml after setting the appropriate values.
+Default behavior is unchanged. Enabling initLease will slightly increase upgrade window latency while init hooks coordinate. Tune private.rollbackTimer.perTenantMillis if your hooks are expected to run longer than 30s.
