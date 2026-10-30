@@ -1,0 +1,22 @@
+# Split proxy coalescer and add per-route buffer profiles to stabilize streaming and tool calls
+
+Motivation: Recent incidents and customer reports showed that a single global coalescer inside the gateway was producing unstable behavior for two different traffic patterns: small, latency-sensitive fncall/tool messages (OpenAI compatibility surface) and large, bulk streaming sessions (batch generation). This PR splits the single coalescing stage into an ingress coalescer (minimizes network syscalls and groups tiny TCP writes) and an egress flusher (controls user-visible flushes and tool-call boundaries).
+
+Summary of changes: split coalesce pipeline, introduce per-route buffer profiles, add sampling-based sizing to pick default profiles, expose new route config knobs, and update the OpenAI compatibility adapter to prefer early-flush for fncall streams. The change aims to reduce perceived latency for function/tool calls while keeping high throughput for bulk streams without regressing cost.
+
+Design details: 1) Two-layer coalescer: ingress_coalescer (packet-level aggregation, aggressive coalesce when backend RTT < 2ms) and egress_flusher (route-aware flush policy that tracks semantic boundaries). 2) Route buffer profiles: tiny (8KB window, aggressive early-flush, max 2 pending fragments), normal (32KB, balanced), bulk (128KB, high aggregation). Profiles are selectable per-route via gateway route config and defaulted using a sampling estimator that observes median payload size for a route over a sliding window. 3) OpenAI compatibility behavior: for routes tagged openai_compat and resembling fncall/tool traffic we enable prefer_early_flush=true which forces boundary-aligned flushes on structured output tokens (ensures fncall JSON objects arrive quickly). 4) Backpressure weight: introduced a numeric per-route backpressure_weight that biases batching decisions and influences when the egress_flusher yields to lower-latency paths. 5) Telemetry: added metrics for coalescer_egress_window_bytes, route_buffer_profile, and fncall_handshake_latency to validate rollout.
+
+Testing and validation: unit tests for the new ingress/egress components, deterministic fncall playback integration test under variable network jitter, compatibility-suite test ensuring OpenAI-style fncall sequences produce the same structured output ordering and flush semantics, and load test showing <5% tail-latency increase for bulk streams while 40-60% p50 reduction for fncall handshake latency in the internal benchmark harness. CI runs included gateway unit, integration, and compatibility suites.
+
+Rollout plan: feature gated behind route flag route_buffer_profile and openai_compat prefer_early_flush. Default behavior remains the same for existing routes until the sampling estimator upgrades profile. Gradual rollout: 10% routes by sampling -> 50% -> full after 72h telemetry review.
+
+Backward compatibility and risk: No API changes to user-visible REST/SDK interfaces. There is a small risk of increased CPU on the gateway due to extra bookkeeping; monitoring added and autoscaling guidance included in release notes.
+
+Related: ENG-1428 (fncall latency reduction), ENG-1439 (gateway streaming stability), SUP-9821 (customer incident reproducer).
+Diego Morales: Please add an integration test that simulates asymmetric network delay between proxy and backend; fncall handshake must preserve object boundaries under delay.
+Sophie Nguyen: Added openai_stream_playback.test.js which runs deterministic fncall sequences with tunable jitter. Also added a jitter harness used in CI.
+Liam O'Connor: Can we reduce the default egress window for 'normal' from 32KB to 24KB to be conservative? Concern around desktop clients with many small tool calls.
+Sophie Nguyen: Dropped normal default to 24KB and measured 8% throughput impact on synthetic bulk streams at p95; included note in rollout and observability to watch throughput change.
+Maria Chen: Add metric to differentiate flushes triggered by boundary vs timeout to make post-mortem easier.
+Sophie Nguyen: Added coalescer_flush_reason label and updated dashboard.
+Introduce per-route buffer profiles and a two-stage coalescer in the gateway. Operators can opt routes into 'tiny/normal/bulk' buffer profiles and enable prefer_early_flush for OpenAI compatibility to improve function/tool call latency. Enabled by config flags and defaulted via a sampling estimator. Observability: new metrics and dashboards for coalescer behavior.
