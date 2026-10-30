@@ -1,0 +1,32 @@
+# overload-sieve: tenant-safe load triage and regional batten hotfix
+
+Context and motivation: Following an incident on 2026-02-15 where a noisy tenant triggered aggressive cross-region failovers and led to a cascade of circuit toggles, we observed two gaps: (1) the global load-shedder treated tenants uniformly which caused important dedicated/enterprise tenants to be moved prematurely, and (2) regional failover logic sometimes retried too eagerly after partial capacity restoration causing oscillation. This PR introduces a tenant-aware overload triage ("overload-sieve") plus a short-term regional 'batten' that throttles cross-region handoffs while KV caches drain. The goal is to reduce unnecessary tenant migration and provide a fast hotfix path until the longer-term scheduling refactor is complete.
+
+What this PR changes: - overload-sieve: a lightweight decision layer that classifies inbound requests into triage buckets (critical, standard, best-effort) based on tenant tier, recent SLO credit, and request metadata. Decisions are used by the local shedder to adjust drop/queueing rates. - regional-batten: a temporary regional cooldown applied after an outbound handoff or failover event; it prevents another cross-region rehandshake for N seconds to give traffic a chance to stabilize and KV caches to flush. - telemetry: new metrics (overload_sieve.bucket, batten.active, batten.reopens) and tracing annotations to help post-deploy analysis. - config: new per-tenant policy entries (sieve_priority, batten_hold_seconds) with sane defaults. - safety checks: explicit guardrails to ensure enterprise/dedicated tenants are exempt from aggressive eviction unless SLO credit is exhausted.
+
+Checklist: - [x] Design review with SRE and Runtime (ENG-2387) - [x] Unit + integration tests for triage mapping and batten timers - [x] Canary in us-west-2 with 2 hours of load-testing - [x] Expanded telemetry and dashboards - [x] Incident postmortem linked (SUP-7211) - [x] Follow-up ticket for full scheduler redesign created (ENG-2396)
+
+Commits (summary): - a1f3b9c: initial overload-sieve implementation and interfaces - c2d7e12: integrate sieve with local load-shedder and add tenant policy schema - d4b8f03: regional-batten timer and gating logic + e2e mocks - f7e1a44: metrics and tracing annotations + prometheus export - 9b3c2de: config defaults, docs, and unit tests - 6cba21f: small fix for concurrency window in batten logic
+
+Files changed (high level): - runtime/shedder/overload_sieve.go (new): implements bucket evaluator and policy lookup - runtime/shedder/strategy.go (mod): consume sieve output to adjust queue/drop ratios - runtime/failover/regional_batten.go (new): cooldown controller with jittered timers - cfg/tenant_policy.yaml (mod): new entries for sieve_priority and batten_hold_seconds - telemetry/metrics.yaml (mod): new metric families and tag guidance - tests/shedder/overload_sieve_test.go (new) - tests/failover/regional_batten_test.go (new) - docs/ops/overload_sieve.md (new) - examples/policies/sample_enterprise_policy.yaml (new)
+
+Small illustrative snippets included in code changes: - overload_sieve.go: bucket := evaluator.Eval(reqCtx, tenantPolicy) // maps to {critical,standard,best-effort} - regional_batten.go: if batten.Active(region) { return ErrBattenActive } // fast-path preventing handoff
+
+Testing and canary notes: - Canary run in us-west-2 for 2 hours with synthetic spike profile; observed 42% reduction in cross-region handoffs for noisy tenants and 18% lower KV cache churn. - Unit tests cover policy parsing and timer jitter. Integration tests simulate a tenant exhausting SLO credits and confirm enterprise tenants are respected by the sieve. - Load tests included a pathological scenario from the incident; the batten removed re-open oscillations across the 45s window used in the canary.
+
+Rollout plan and mitigation: - Immediate: merged to main and deployed as a hotfix candidate to production with regional canaries (us-west-2, eu-central-1). - Monitoring: dashboards added under SRE -> "overload-sieve" and "regional-batten". Alerts: batten.active high rate in multiple regions triggers page. - If regressions observed: quick rollback by reverting the merge commit; a feature-flag gate exists on the batten and sieve (defaults to ON for canaries, OFF globally if rollback required).
+
+Related work and follow-ups: - ENG-2396: scheduler refactor to bake tenant tiers and load signals into the long-term allocator. - Observability TODO: add 95/99 quantile breakdowns for batten.reopen latency and per-tenant triage ratios. - Product: review safe defaults for small customers so they aren't unexpectedly deprioritized.
+
+Why this is different from previous fixes: The approach purposely adds a short-lived, policy-driven triage layer and a conservative regional cooldown instead of immediately changing eviction rates. This reduces churn and gives the control plane time to harmonize state when capacity fluctuates, avoiding the oscillatory patterns we saw. It is intended as a surgical hotfix: small surface area, targeted metrics, easy rollback.
+
+Incident link: https://linear.app/redwood/issue/SUP-7211/noisy-tenant-induced-cascade-failover
+
+Authors notes: deploy configured for a rolling canary; please watch batten.active and overload_sieve.bucket:critical for the first 4 hours post-deploy. Detailed deploy runbook in docs/ops/overload_sieve.md.
+Liam O'Connor (reviewer) - 2026-02-21: Left a few nits, main concern is concurrency in regional_batten timer; please add an atomic guard to avoid double-clear during fast reopens.
+Priya Desai (author) - 2026-02-21: Added atomic.CompareAndSwap guard in 6cba21f and updated tests to validate a double-clear scenario.
+Maya Chen (reviewer) - 2026-02-23: Can we ensure that dedicated tenants have a configurable override? Suggest adding tenant-level 'batten_exempt' flag.
+Priya Desai (author) - 2026-02-24: Added 'batten_exempt' to tenant policy schema and wired through the evaluator. Updated sample policy and docs.
+Ethan Patel (approver) - 2026-02-26: Verified canary metrics and load-tests. Approved. Marking for squash-merge once CI green.
+CI Bot - 2026-02-26: All checks passed after a re-run. e2e flake fixed by test timeout bump.
+Hotfix: introduce a tenant-aware overload triage ('overload-sieve') and regional batten to avoid cascading failovers during multi-region capacity degradations; improved metrics for triage decisions and additional safety guards for dedicated tenants.
