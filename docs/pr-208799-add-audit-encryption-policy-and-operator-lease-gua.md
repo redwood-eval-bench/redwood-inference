@@ -1,0 +1,23 @@
+# Add audit encryption policy and operator lease guard
+
+Context: We need stronger guarantees that audit payloads emitted from downstream services are both integrity-signed and encrypted with tenant-aware keys, and that operator-scoped elevated actions are timeboxed via short-lived leases that are provable and revocable. This PR adds two coordinated features: 1) an audit envelope encryption policy that wraps audit events in an authenticated, tenant-bound envelope encrypted with a CMK-resident key (KMS-integrated); 2) an operator lease guard: a temporal RBAC layer where elevated operator tokens are issued with KMS-signed lease proofs and validated by the gate before performing sensitive actions.
+
+What changed (high level): - audit/encryption: add envelope_writer and envelope_reader that construct AES-GCM envelopes with a per-tenant KMS-wrapped data key, plus a provenance header (kms_key_id, nonce, region_tag). Envelopes are versioned (v1). - auth/rbac: introduce lease_manager and lease_prover. Leases are requested via operator service, signed by a KMS asymmetric key (lease signing key) and carry expiry + operation-scopes. Gate middleware verifies signature and expiry and increments audit counters for issuance/validation. - migration: audit-forwarder updated to support transparent rewrap for legacy plaintext events during a staged rollout. A migration job (scripts/migrate-audit-to-envelopes) re-encrypts historical events into envelopes for customers that opt into full encryption. - helm/ops: add feature flags (audit.encryption.enabled, operator.leases.enabled) and a runtime toggle for staged rollout. - docs: new security runbook and operator lease docs (docs/security/operator-leases.md) and migration guide.
+
+Why: This design gives: (a) tenant-scoped confidentiality for audit bodies while preserving deterministic indexing for metadata; (b) non-repudiable operator lease proofs allowing short-lived elevated actions to be revoked or audited; (c) clear migration path with opt-in rewrap to avoid customer-impact during rollout.
+
+Checklist: - [x] Unit tests for envelope_reader/writer and lease signature validation - [x] Integration tests exercising KMS-wrapped data key generation (using KMS emulator in CI) - [x] Migration script + dry-run mode - [x] Helm values and runtime feature gate - [x] Docs and runbook - [x] Security review (SEC-129)
+
+Rollout plan: 1) Deploy to canary region with audit.encryption.enabled=false and operator.leases.enabled=false. 2) Enable audit.encryption in passive mode (writer emits envelopes, forwarder still accepts plaintext during transition). 3) Run migration dry-run and sample rewrap for selected tenants. 4) Flip opt-in tenants to envelope-only and enable operator.leases for SRE/SE teams. 5) Gradually expand. Rollback flips feature flags and runs rewrap-reverse tool if needed.
+
+Testing: CI covers unit/integration with local KMS emulator. Manual smoke on staging included: issuance of lease -> signed token verification -> run privileged endpoint -> audit entry present and readable only via envelope_reader with tenant CMK.
+
+Related: ENG-8421 (RBAC leasing), SEC-129 (audit encryption threat model), SUP-4421 (customer reported audit exposition).
+Marcus Li: Left a few comments on key rotation semantics and cache expiry for wrapped DEKs. Also: please ensure envelope versioning is forward-compatible.
+Aisha Khan: Addressed in a1f3d9c and b4e2f77 — added explicit rotation tests and a migration toggle. Reply: the cache TTL for wrapped DEKs is now a helm value (audit.encryption.dek_cache_ttl).
+Sofia Patel: Can we add a monitoring metric for 'lease_validation_failures' and an alert for sudden rises?
+Aisha Khan: Added metric lease_validation_failures and alert rule in deploy/helm/templates/alerts.yaml in follow-up commit f2aa4b0.
+Diego Fernandez: Security scan flagged insufficient entropy in the emulator-only keygen helper — tests updated to use crypto/rand.
+Add tenant-bound audit envelope encryption (opt-in) and temporal operator leases (RBAC) using KMS-signed proofs. Feature gated via helm values: audit.encryption.enabled and operator.leases.enabled. Migration tooling provided to rewrap historical audit events.
+Operators must provision a lease-signing KMS key (asymmetric) and set KMS role bindings. Default helm values leave features disabled. Migration script supports dry-run. See docs/security/audit-encryption-migration.md for step-by-step commands.
+Threat model appendix added to SEC-129; attacker incentives considered for replay, rewrap, and key compromise. Added mitigations: envelope versioning, short DEK cache TTLs, KMS key rotation guidance.
