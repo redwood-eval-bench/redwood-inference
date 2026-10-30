@@ -1,0 +1,28 @@
+# v1/chat: output coordinator + role-pruner for compact structured tool responses
+
+Motivation: customers relying on OpenAI /v1/chat.completions compatibility have increasingly complex tool/function outputs and varied role labels from legacy clients. The streaming path was producing verbose, repeated JSON fragments for tool responses and leaking low-confidence token-level logprobs during long streams. This PR introduces an 'output coordinator' layer in the v1 chat adapter and a conservative 'role-pruner' to normalize incoming roles and emit a compact structured mode for tool/function outputs.
+
+Summary of changes: added an adapter-level coordinator that: 1) recognizes and collapses repeated tool JSON fragments into a single compact structure when clients request compact output (new query param compact_output=true), 2) supplies a configurable stop_hint_priority so that explicit stop sequences sent by the API call are respected ahead of model-internal heuristics when desired, and 3) filters streaming logprob deltas below a configurable threshold to reduce bandwidth and surface only meaningful token confidence changes. The role-pruner maps unknown or noisy role labels (e.g. "assistant_bot", "system_user") into canonical roles (system, user, assistant) while preserving an optional role_metadata bag in streaming envelopes. The default mapping is conservative to avoid breaking customers who depend on custom roles.
+
+API surface: new v1/chat query params (all optional, backward compatible): compact_output (boolean) - when true, server collapses repeated tool JSON fragments and returns a single 'tool_result' object per tool invocation; compact_mode (string) - "compact"|"verbose" controls how much ancillary metadata is included; stop_hint_weight (float 0-1) - higher values prefer explicit stop param over model-internal stops; logprob_filter_threshold (float 0-1) - tokens with probability below threshold will have logprobs suppressed in streaming deltas to reduce bandwidth. The existing 'function_call' behavior is unchanged unless compact_output is enabled.
+
+Runtime changes: introduced runtime/stream/coordinator.py to manage stream fragment coalescing with backpressure awareness, integrated compacting logic into the v1 adapter to avoid double-encoding, and added a small heuristic to avoid coalescing across user-turn boundaries. Implemented a lightweight role-pruner in server/adapter/openai_compat/v1_chat_adapter.py that consults a normalization table and emits a role_hints field on the streaming envelope to surface pruned-original-role for observability.
+
+Compatibility and safety: defaults preserve current behavior (compact_output=false, stop_hint_weight=0.5, logprob_filter_threshold=0.01). Role-pruner requires an opt-in flag (role_prune=true) for strict normalization; otherwise we only emit role_hints. The change intentionally avoids rewriting function signatures or existing response envelopes to prevent breaking existing integrations.
+
+Testing and benchmarks: added integration tests under tests/integration/test_toolflow_streaming.py and unit tests for coordinator heuristics. Benchmarks run on perf-canary showed ~9-12% reduction in outbound streaming tokens for workloads with verbose tool JSONs (internal benchmark workload 'toolsuite-large-2025'), and ~3-6% average reduction in end-to-end latency due to fewer serialization events.
+
+Docs and migration: updated docs/openai_compat.md with example calls, recommended migration path, and a sample shim for SDKs to opt-in to compact_output gradually. Release notes include guidance on when to enable compact_output and how to tune logprob_filter_threshold for telemetry vs fidelity.
+
+Checklist: - [x] Runtime coordinator implementation + unit tests - [x] Role-pruner with opt-in flag - [x] SDK sample snippet and doc update - [x] Perf benchmark and canary run - [x] Security review for envelope changes
+
+Notes: This PR intentionally keeps the compact representation as an opt-in addition. We observed a handful of legacy clients that relied on repeated fragments for incremental parsing; for those customers we recommend gradual migration with compact_output=false while testing SDK helpers that reconstruct streamed fragments into a compact object on the client side.
+Ethan Park: Can we avoid mapping custom roles that start with 'x-'? Some enterprise customers use 'x-internal' roles and rely on them for routing.
+Maya Singh: Good catch — updated the normalization table and added an 'allow_prefixes' config that preserves roles with configured prefixes. Default includes 'x-'.
+Diego Rivera: The compact_output handshake looks fine but I worry about partial JSON fragments being dropped during reconnects.
+Maya Singh: Coordinator now emits a sentinel event on stream disconnect that lists in-flight tool ids; client-side SDKs can use that to resume reassembly. Added integration test for reconnect scenario.
+Priya Nair: Can we add an opt-out to keep full token logprobs for auditors?
+Maya Singh: Added logprob_preserve_for_roles list in config and documented how SSO teams can request full logprobs; default remains filtered.
+Ethan Park: CI flakes on arm64 linting job initially.
+Maya Singh: Fixed lint in .github/workflows and bumped a pinned dependency; reran CI and all checks passed.
+Introduce optional compact_output for v1/chat to collapse repetitive tool JSON fragments and reduce streaming bandwidth. Add role_prune opt-in to normalize noisy role labels while preserving original role metadata. New tuning params: stop_hint_weight and logprob_filter_threshold. Backward compatible by default; opt-in for compacting behavior.
